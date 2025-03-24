@@ -1,199 +1,206 @@
 import pandas as pd
-from sklearn.ensemble import IsolationForest
-import google.generativeai as genai
 import os
 import logging
 import configparser
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
+from tqdm import tqdm
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
+import torch
 
-# Load configuration from properties file
+# Load configuration
 config = configparser.ConfigParser()
 config_file = os.path.join(os.path.dirname(__file__), 'config.properties')
 if not os.path.exists(config_file):
     raise FileNotFoundError(f"Config file not found: {config_file}")
 config.read(config_file)
 
-# Extract config values
 BANK_FILE = config['Paths']['bank_file']
 INTERNAL_FILE = config['Paths']['internal_file']
 LOG_DIR = config['Paths']['log_dir']
 LOG_FILE = os.path.join(LOG_DIR, config['Paths']['log_file'])
 OUTPUT_DIR = config['Paths']['output_dir']
 OUTPUT_CSV = os.path.join(OUTPUT_DIR, config['Paths']['output_csv'])
-GEMINI_API_KEY = config['Gemini']['api_key']
-GEMINI_MODEL = config['Gemini']['model']
-FEATURES = config['Detection'].get('features', 'Amount')
-FEATURES = [f.strip() for f in FEATURES.split(',')] if FEATURES.strip() else ['Amount']
-CONTAMINATION = config['Detection'].get('contamination', '')
-if CONTAMINATION.strip().lower() == 'none' or not CONTAMINATION.strip():
-    CONTAMINATION = None
-else:
-    try:
-        CONTAMINATION = float(CONTAMINATION)
-    except ValueError as e:
-        raise ValueError(f"Invalid contamination value in config: {e}")
-
-# Email config
-SMTP_SERVER = config['Email']['smtp_server']
-SMTP_PORT = int(config['Email']['smtp_port'])
-SENDER_EMAIL = config['Email']['sender_email']
-SENDER_PASSWORD = config['Email']['sender_password']
-RECIPIENT_EMAIL = config['Email']['recipient_email']
+CORRECTED_CSV = os.path.join(OUTPUT_DIR, 'corrected_bank_data.csv')
 
 # Configure logging
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE)
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)]
 )
 logger = logging.getLogger(__name__)
 
-# Configure Gemini API
-if not GEMINI_API_KEY:
-    logger.error("Gemini API key not provided in config.properties.")
-    raise ValueError("Gemini API key not provided in config.properties.")
-genai.configure(api_key=GEMINI_API_KEY)
-
-def send_email(subject, body, attachment_path=None):
-    """Sends an email with optional attachment."""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = RECIPIENT_EMAIL
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-
-        if attachment_path and os.path.exists(attachment_path):
-            with open(attachment_path, 'rb') as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
-                part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
-                msg.attach(part)
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-        logger.info("Email sent successfully: %s", subject)
-    except Exception as e:
-        logger.error("Failed to send email: %s", e)
+# Load DistilBERT model and tokenizer
+tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased')
+model.eval()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
 
 def load_data(bank_file, internal_file):
-    """Loads bank statement and internal transaction records with error handling."""
-    try:
-        bank_data = pd.read_csv(bank_file)
-        internal_data = pd.read_csv(internal_file)
-        required_cols = {'Transaction ID', 'Amount', 'Date'}
-        if not (required_cols.issubset(bank_data.columns) and required_cols.issubset(internal_data.columns)):
-            logger.error("Missing required columns in input files.")
-            raise ValueError("Missing required columns.")
-        logger.info("Data loaded successfully from %s and %s", bank_file, internal_file)
-        return bank_data, internal_data
-    except FileNotFoundError as e:
-        logger.error("File not found: %s", e)
-        raise
-    except Exception as e:
-        logger.error("Data loading error: %s", e)
-        raise
+    """Load CSV files into memory."""
+    logger.info("Loading daily data from %s", bank_file)
+    bank_data = pd.read_csv(bank_file)
+    logger.info("Loading historical data from %s", internal_file)
+    internal_data = pd.read_csv(internal_file)
+    return bank_data, internal_data
 
-def reconcile_transactions(bank_data, internal_data):
-    """Finds mismatched transactions between bank and internal records."""
-    try:
-        merged = pd.merge(bank_data, internal_data, on=['Transaction ID', 'Amount', 'Date'],
-                         how='outer', indicator=True)
-        unmatched = merged[merged['_merge'] != 'both']
-        logger.info("Reconciliation complete. Found %d unmatched transactions.", len(unmatched))
-        logger.debug("Unmatched transactions:\n%s", unmatched.to_string())
-        return unmatched
-    except Exception as e:
-        logger.error("Reconciliation error: %s", e)
-        raise
+def smart_reconcile(bank_data, internal_data):
+    """Skip traditional reconciliation since Transaction IDs are unique."""
+    logger.info("Skipping Transaction ID-based reconciliation as all daily transactions are new.")
+    new_transactions = bank_data.copy()
+    duplicates = pd.DataFrame(columns=bank_data.columns)
+    logger.info("Reconciliation: %d new, %d duplicates", len(new_transactions), len(duplicates))
+    return new_transactions, duplicates
 
-def estimate_contamination(data, feature='Amount'):
-    """Estimates contamination based on data variance."""
-    std = data[feature].std()
-    mean = data[feature].mean()
-    outlier_threshold = mean + 3 * std
-    contamination = len(data[data[feature] > outlier_threshold]) / len(data)
-    estimated = max(min(contamination, 0.1), 0.01)
-    logger.debug("Estimated contamination: %.3f", estimated)
-    return estimated
+def get_anomaly_score(prompt):
+    """Score anomaly using DistilBERT locally."""
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    inputs = {key: val.to(device) for key, val in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        score = torch.softmax(logits, dim=1)[0][1].item()
+    return score
 
-def detect_fraud(data, features=FEATURES, contamination=CONTAMINATION):
-    """Detects fraudulent transactions using Isolation Forest."""
-    try:
-        if contamination is None:
-            contamination = estimate_contamination(data, features[0])
-        if 'Date' in features:
-            data['DateNumeric'] = pd.to_datetime(data['Date']).astype(int) / 10**9
-            features = ['DateNumeric' if f == 'Date' else f for f in features]
-        model = IsolationForest(contamination=contamination, random_state=42)
-        data['Anomaly_Score'] = model.fit_predict(data[features])
-        anomalies = data[data['Anomaly_Score'] == -1]
-        logger.info("Detected %d anomalies using features: %s", len(anomalies), features)
-        logger.debug("Anomalies:\n%s", anomalies.to_string())
-        return anomalies
-    except Exception as e:
-        logger.error("Fraud detection error: %s", e)
-        raise
+def train_prediction_model(historical_data):
+    """Train a Linear Regression model per account to predict Balance Difference."""
+    models = {}
+    historical_data['As of Date'] = pd.to_datetime(historical_data['As of Date'])
+    historical_data['Days'] = (historical_data['As of Date'] - historical_data['As of Date'].min()).dt.days
+    
+    for account, group in historical_data.groupby('Account Number'):
+        if len(group) < 2:  # Need at least 2 points for regression
+            continue
+        X = group['Days'].values.reshape(-1, 1)
+        y = group['Balance Difference'].values
+        reg = LinearRegression()
+        reg.fit(X, y)
+        models[account] = reg
+    return models
 
-def explain_anomalies(anomalies, bank_data):
-    """Uses Gemini AI with context to explain anomalies."""
-    try:
-        explanations = []
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        mean_amount = bank_data['Amount'].mean()
-        std_amount = bank_data['Amount'].std()
+def predict_balance(account, date, models, historical_data):
+    """Predict Balance Difference for a given account and date."""
+    if account not in models:
+        hist_mean = historical_data[historical_data['Account Number'] == account]['Balance Difference'].mean()
+        return hist_mean  # Fallback to mean if no model
+    
+    reg = models[account]
+    base_date = pd.to_datetime(historical_data['As of Date'].min())
+    days = (pd.to_datetime(date) - base_date).days
+    predicted = reg.predict([[days]])[0]
+    return max(predicted, 0)  # Ensure non-negative
 
-        for idx, row in anomalies.iterrows():
-            prompt = (
-                f"Transaction ID {row['Transaction ID']} with amount {row['Amount']} on {row['Date']} "
-                f"is flagged as suspicious. Details: {row.to_dict()}. "
-                f"Context: Mean amount is {mean_amount:.2f}, std dev is {std_amount:.2f}. "
-                f"Why might this be fraudulent?"
-            )
-            response = model.generate_content(prompt)
-            explanations.append(response.text)
-            logger.debug("Explanation for Transaction ID %s: %s", row['Transaction ID'], response.text)
+def detect_trend_anomalies(bank_data, internal_data):
+    """Detect trend-specific anomalies with specific explanations."""
+    combined_data = pd.concat([internal_data, bank_data]).sort_values(['Account Number', 'As of Date'])
+    combined_data['Balance Difference'] = combined_data['Balance Difference'].astype(float)
+    combined_data = combined_data.reset_index(drop=True)
+    
+    anomalies = []
+    account_groups = combined_data.groupby('Account Number')
+    
+    for account, group in tqdm(account_groups, desc="Analyzing trends"):
+        group = group.reset_index(drop=True)
+        daily_group = bank_data[bank_data['Account Number'] == account]
+        if daily_group.empty:
+            continue
         
-        anomalies = anomalies.copy()
-        anomalies.loc[:, 'Explanation'] = explanations
-        logger.info("Generated explanations for %d anomalies", len(anomalies))
-        logger.debug("Explained anomalies:\n%s", anomalies.to_string())
-        return anomalies
-    except Exception as e:
-        logger.error("Gemini API error: %s", e)
-        raise
+        window = 30
+        rolling_mean = group['Balance Difference'].rolling(window=window, min_periods=1).mean()
+        rolling_std = group['Balance Difference'].rolling(window=window, min_periods=1).std()
+        diffs = group['Balance Difference'].diff()
+        
+        for idx, row in daily_group.iterrows():
+            hist_indices = group.index[group['Transaction ID'] == row['Transaction ID']].tolist()
+            if not hist_indices:
+                continue
+            hist_idx = hist_indices[0]
+            
+            current_pos = hist_idx
+            past_mean = rolling_mean.iloc[max(0, current_pos - window):current_pos + 1].iloc[-1]
+            past_std = rolling_std.iloc[max(0, current_pos - window):current_pos + 1].iloc[-1]
+            trend_up = (diffs.iloc[max(0, current_pos - 5):current_pos + 1] > 0).all()
+            too_high = row['Balance Difference'] > (past_mean + 3 * past_std)
+            too_low = row['Balance Difference'] < (past_mean - 3 * past_std)
+            
+            if trend_up or too_high or too_low:
+                prompt = (
+                    f"Account Number {account}, Transaction ID {row['Transaction ID']}, "
+                    f"Balance Difference {row['Balance Difference']}, As of Date {row['As of Date']}. "
+                    f"History: Mean {past_mean:.2f}, Std {past_std:.2f}, Last 5 diffs positive: {trend_up}. "
+                    f"Conditions: Trend Up: {trend_up}, Too High: {too_high}, Too Low: {too_low}. "
+                    f"Is this anomalous? Provide a score (0-1) and explanation."
+                )
+                score = get_anomaly_score(prompt)
+                if trend_up and not (too_high or too_low):
+                    explanation = "Trend up detected"
+                elif too_high:
+                    explanation = "Too high detected"
+                elif too_low:
+                    explanation = "Too low detected"
+                else:
+                    explanation = "Anomaly detected"
+                if score >= 0.5:
+                    anomalies.append((row, score, explanation))
+    
+    result = pd.DataFrame([a[0] for a in anomalies], columns=bank_data.columns)
+    result['Fraud_Score'] = [a[1] for a in anomalies]
+    result['Explanation'] = [a[2] for a in anomalies]
+    logger.info("Detected %d trend-based anomalies", len(result))
+    return result
+
+def smart_correct_anomalies(anomalies, bank_data, internal_data):
+    """Correct anomalies using model-predicted Balance Difference."""
+    corrected = bank_data.copy()
+    if 'Status' not in corrected.columns:
+        corrected['Status'] = ''
+    
+    # Train prediction models
+    prediction_models = train_prediction_model(internal_data)
+    
+    for idx, row in tqdm(anomalies.iterrows(), total=len(anomalies), desc="Correcting anomalies"):
+        prompt = (
+            f"Anomaly: Transaction ID {row['Transaction ID']}, Account Number {row['Account Number']}, "
+            f"Balance Difference {row['Balance Difference']}, As of Date {row['As of Date']}. "
+            f"Explanation: {row['Explanation']}. "
+            f"Suggest one of: 'correct balance to [value]', 'correct date to [date]', or 'flag as fraud'."
+        )
+        score = get_anomaly_score(prompt)
+        
+        condition = corrected['Transaction ID'] == row['Transaction ID']
+        if "trend up" in row['Explanation'].lower():
+            predicted_balance = predict_balance(row['Account Number'], row['As of Date'], prediction_models, internal_data)
+            response = f"correct balance to {predicted_balance}"
+            try:
+                new_amount = float(response.lower().split('correct balance to')[-1].strip())
+                corrected.loc[condition, 'Balance Difference'] = new_amount
+                logger.info("Corrected Balance Difference for %s: %s -> %s (predicted)", 
+                            row['Transaction ID'], row['Balance Difference'], new_amount)
+            except ValueError:
+                logger.warning("Could not parse new amount: %s", response)
+        elif "too high" in row['Explanation'].lower() or "too low" in row['Explanation'].lower():
+            corrected.loc[condition, 'Status'] = 'Flagged as Fraud'
+            logger.warning("Flagged as fraud: %s", row['Transaction ID'])
+    
+    return corrected
 
 if __name__ == "__main__":
     try:
         bank_data, internal_data = load_data(BANK_FILE, INTERNAL_FILE)
-        unmatched_transactions = reconcile_transactions(bank_data, internal_data)
+        new_transactions, duplicates = smart_reconcile(bank_data, internal_data)
         
-        anomalies = detect_fraud(bank_data)
+        anomalies = detect_trend_anomalies(bank_data, internal_data)
         
-        explained_anomalies = explain_anomalies(anomalies, bank_data)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        anomalies.to_csv(OUTPUT_CSV, index=False)
+        logger.info("Anomaly results saved to %s", OUTPUT_CSV)
         
-        os.makedirs(OUTPUT_DIR, exist_ok=True)  # Create output directory if it doesn't exist
-        explained_anomalies.to_csv(OUTPUT_CSV, index=False)
-        logger.info("Results saved to %s", OUTPUT_CSV)
+        corrected_bank_data = smart_correct_anomalies(anomalies, bank_data, internal_data)
+        corrected_bank_data.to_csv(CORRECTED_CSV, index=False)
+        logger.info("Corrected bank data saved to %s", CORRECTED_CSV)
         
-        # Send success email with attachment
-        send_email(
-            subject="Fraud Detection Results",
-            body=f"Anomaly detection completed successfully. Results saved to {OUTPUT_CSV}.",
-            attachment_path=OUTPUT_CSV
-        )
     except Exception as e:
         logger.error("Program failed: %s", e)
-        # Send failure email
-        send_email(
-            subject="Fraud Detection Failed",
-            body=f"Anomaly detection failed with error: {str(e)}"
-        )
