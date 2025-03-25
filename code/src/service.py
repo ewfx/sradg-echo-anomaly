@@ -1,4 +1,3 @@
-# service.py
 import pandas as pd
 import os
 from tqdm import tqdm
