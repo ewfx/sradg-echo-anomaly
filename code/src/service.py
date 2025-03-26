@@ -4,7 +4,7 @@ from tqdm import tqdm
 import numpy as np
 from utils import (
     setup_logging, load_config, load_data, initialize_model,
-    get_anomaly_score, train_prediction_model, predict_balance
+    get_anomaly_score, train_prediction_model, predict_balance, send_email
 )
 
 class BankDataService:
@@ -18,6 +18,15 @@ class BankDataService:
         self.log_dir = self.config['Paths']['log_dir']
         self.log_file = os.path.join(self.log_dir, self.config['Paths']['log_file'])
         self.output_dir = self.config['Paths']['output_dir']
+
+        # Email configuration
+        self.smtp_config = {
+            'smtp_server': self.config['Email']['smtp_server'],
+            'smtp_port': int(self.config['Email']['smtp_port']),
+            'sender_email': self.config['Email']['sender_email'],
+            'sender_password': self.config['Email']['sender_password'],
+            'recipient_email': self.config['Email']['recipient_email']
+        }
 
         # Validate paths
         if not os.path.exists(self.bank_file):
@@ -146,21 +155,34 @@ class BankDataService:
 
     def process_bank_data(self, request_id: str) -> dict:
         """Process bank data and save results to output_dir."""
-        bank_data, internal_data = load_data(self.logger, self.bank_file, self.internal_file)
-        new_transactions, duplicates = self.smart_reconcile(bank_data, internal_data)
-        
-        anomalies = self.detect_trend_anomalies(bank_data, internal_data)
-        anomalies_path = os.path.join(self.output_dir, f"anomalies_{request_id}.csv")
-        anomalies.to_csv(anomalies_path, index=False)
-        self.logger.info("Anomaly results saved to %s (rows: %d)", anomalies_path, len(anomalies))
-        
-        corrected_bank_data = self.smart_correct_anomalies(anomalies, bank_data, internal_data)
-        corrected_path = os.path.join(self.output_dir, f"corrected_{request_id}.csv")
-        corrected_bank_data.to_csv(corrected_path, index=False)
-        self.logger.info("Corrected bank data saved to %s", corrected_path)
-        
-        return {
-            "anomalies_file": anomalies_path,
-            "corrected_file": corrected_path,
-            "request_id": request_id
-        }
+        try:
+            bank_data, internal_data = load_data(self.logger, self.bank_file, self.internal_file)
+            new_transactions, duplicates = self.smart_reconcile(bank_data, internal_data)
+            
+            anomalies = self.detect_trend_anomalies(bank_data, internal_data)
+            anomalies_path = os.path.join(self.output_dir, f"anomalies_{request_id}.csv")
+            anomalies.to_csv(anomalies_path, index=False)
+            self.logger.info("Anomaly results saved to %s (rows: %d)", anomalies_path, len(anomalies))
+            
+            corrected_bank_data = self.smart_correct_anomalies(anomalies, bank_data, internal_data)
+            corrected_path = os.path.join(self.output_dir, f"corrected_{request_id}.csv")
+            corrected_bank_data.to_csv(corrected_path, index=False)
+            self.logger.info("Corrected bank data saved to %s", corrected_path)
+            
+            # Send email with attachment if anomalies were detected and corrected
+            if not anomalies.empty:
+                subject = "Bank Anomaly Detection: Anomalies Detected and Corrected"
+                body = f"Detected and corrected {len(anomalies)} anomalies.\nAnomaly file: {anomalies_path}\nCorrected file attached."
+                send_email(self.logger, self.smtp_config, subject, body, attachment_path=corrected_path)
+            
+            return {
+                "anomalies_file": anomalies_path,
+                "corrected_file": corrected_path,
+                "request_id": request_id
+            }
+        except Exception as e:
+            # Send email on failure
+            subject = "Bank Anomaly Detection: Processing Failed"
+            body = f"Bank data processing failed with request ID {request_id}.\nError: {str(e)}"
+            send_email(self.logger, self.smtp_config, subject, body)
+            raise  # Re-raise the exception to be caught by the API layer

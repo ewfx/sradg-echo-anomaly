@@ -5,6 +5,10 @@ import configparser
 from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
 import torch
 from sklearn.linear_model import LinearRegression
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 def setup_logging(log_dir, log_file):
     """Configure logging with file and console handlers."""
@@ -81,3 +85,28 @@ def predict_balance(account, date, models, historical_data):
     days = (pd.to_datetime(date) - base_date).days
     predicted = reg.predict([[days]])[0]
     return max(predicted, 0)
+
+def send_email(logger, smtp_config, subject, body, attachment_path=None):
+    """Send an email using the provided SMTP configuration, with optional attachment."""
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = smtp_config['sender_email']
+        msg['To'] = smtp_config['recipient_email']
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Attach file if provided
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, 'rb') as f:
+                attachment = MIMEApplication(f.read(), _subtype="csv")
+                attachment.add_header('Content-Disposition', 'attachment', filename=os.path.basename(attachment_path))
+                msg.attach(attachment)
+            logger.info("Attached file: %s", attachment_path)
+
+        with smtplib.SMTP(smtp_config['smtp_server'], smtp_config['smtp_port']) as server:
+            server.starttls()
+            server.login(smtp_config['sender_email'], smtp_config['sender_password'])
+            server.send_message(msg)
+        logger.info("Email sent successfully: %s", subject)
+    except Exception as e:
+        logger.error("Failed to send email: %s", str(e))

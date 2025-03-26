@@ -4,6 +4,8 @@ import uvicorn
 from uuid import uuid4
 from service import BankDataService
 import os
+from utils import send_email
+
 
 # FastAPI app initialization
 app = FastAPI(title="Bank Anomaly Detection API")
@@ -21,6 +23,10 @@ def process_bank_data_api():
         return JSONResponse(content=result)
     except Exception as e:
         service.logger.error("Processing failed: %s", str(e))
+        # Send email on API-level failure
+        subject = "Bank Anomaly Detection API: Failure"
+        body = f"API request failed with request ID {request_id}.\nError: {str(e)}"
+        send_email(service.logger, service.smtp_config, subject, body)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 if __name__ == "__main__":
