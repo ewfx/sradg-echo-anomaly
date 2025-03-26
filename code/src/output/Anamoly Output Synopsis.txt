@@ -1,0 +1,8 @@
+Output Result 
+
+System Spec
+
+Windows 11
+16 gb ram
+
+For 100k results anamoly detection, tool is taking a duration of 10 seconds
