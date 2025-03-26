@@ -145,10 +145,11 @@ class BankDataService:
                     corrected.loc[condition, 'Balance Difference'] = new_amount
                     self.logger.info("Corrected Balance Difference for %s: %s -> %s (predicted)", 
                                      row['Transaction ID'], row['Balance Difference'], new_amount)
+                    corrected.loc[condition, 'Status'] = 'Flagged as Fraud and raised incident and sent email to all stakeholders'
                 except ValueError:
                     self.logger.warning("Could not parse new amount: %s", response)
             elif "too high" in row['Explanation'].lower() or "too low" in row['Explanation'].lower():
-                corrected.loc[condition, 'Status'] = 'Flagged as Fraud'
+                corrected.loc[condition, 'Status'] = 'Flagged as Fraud and raised incident and sent email to all stakeholders'
                 self.logger.warning("Flagged as fraud: %s", row['Transaction ID'])
         
         return corrected
